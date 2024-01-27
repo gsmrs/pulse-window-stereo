@@ -1,7 +1,104 @@
 #include <assert.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <string.h>
 #include <X11/Xlib.h>
+#include <pulse/pulseaudio.h>
+
+#define ARENA_IMPLEMENTATION
+#include "arena.h"
+
+#define NOT_IMPLEMENTED() do { fprintf(stderr, "%s:%d (%s): not implemented\n", __FILE__, __LINE__, __func__); __builtin_trap(); } while (0);
+
+#define LOGF(msg, ...) fprintf(stderr, "%s:%d(%s): " msg "\n", __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define LOG(msg) fprintf(stderr, "%s:%d(%s): %s\n", __FILE__, __LINE__, __func__, msg)
+
+typedef struct SinkInput {
+    unsigned int sink_input_index;
+    int pid;
+    pa_cvolume true_volume;
+} SinkInput;
+
+#define NUM_MAX_SINK_INPUTS 1024
+
+typedef struct {
+    bool pulse_initialized;
+
+    SinkInput sink_inputs[NUM_MAX_SINK_INPUTS];
+} State;
+
+static void state_init(State *state) {
+    state->pulse_initialized = 0;
+
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        state->sink_inputs[i].sink_input_index = PA_INVALID_INDEX;
+        state->sink_inputs[i].pid = -1;
+    }
+}
+
+/**
+ * Attempt to allocate a new SinkInput inside `state`.
+ */
+static SinkInput *
+add_sink_input(State *state) {
+    LOG("New sink input requested");
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        if (state->sink_inputs[i].sink_input_index == PA_INVALID_INDEX) {
+            assert(state->sink_inputs[i].pid == -1);
+            return &state->sink_inputs[i];
+        }
+    }
+    return NULL;
+}
+
+static SinkInput *
+get_sink_input(State *state, unsigned int index) {
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        if (state->sink_inputs[i].sink_input_index == index) {
+            return &state->sink_inputs[i];
+        }
+    }
+    return NULL;
+}
+
+static SinkInput *
+get_sink_input_by_pid(State *state, int pid) {
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        if (state->sink_inputs[i].pid == pid) {
+            return &state->sink_inputs[i];
+        }
+    }
+    return NULL;
+}
+
+static void
+remove_sink_input(State *state, unsigned int index) {
+    LOGF("removing sink input %u", index);
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        SinkInput *input = &state->sink_inputs[i];
+        if (input->sink_input_index == index) {
+            input->sink_input_index = PA_INVALID_INDEX;
+            input->pid = -1;
+            memset(&input->true_volume, 0, sizeof(input->true_volume));
+            break;
+        }
+    }
+}
+
+static void
+debug_print_sink_inputs(State *state) {
+    LOG("------------------------------------------------------------");
+    for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+        if (state->sink_inputs[i].sink_input_index != PA_INVALID_INDEX) {
+            LOGF("{ .index = %u, .pid = %d }",
+                    state->sink_inputs[i].sink_input_index,
+                    state->sink_inputs[i].pid);
+        }
+    }
+    LOG("------------------------------------------------------------");
+}
 
 static bool
 get_first_child(Display *d, Window w, Window *child) {
@@ -17,7 +114,7 @@ get_first_child(Display *d, Window w, Window *child) {
     }
 }
 
-static int
+static pid_t
 get_window_pid(Display *display, Window window) {
     Atom actual_type_return;
     int actual_format_return;
@@ -47,7 +144,8 @@ get_window_pid(Display *display, Window window) {
     }
 }
 
-static void debug_dump_properties(Display *d, Window w) {
+static void
+debug_dump_properties(Display *d, Window w) {
     Window root, parent, *children = NULL;
     unsigned int nchildren = 0;
     XQueryTree(d, w, &root, &parent, &children, &nchildren);
@@ -106,9 +204,9 @@ find_window_name(Display *display, Window window) {
     }
 }
 
-static int
+static pid_t
 find_window_pid(Display *display, Window window) {
-    int pid = get_window_pid(display, window);
+    pid_t pid = get_window_pid(display, window);
     if (pid != -1) {
         return pid;
     }
@@ -121,7 +219,421 @@ find_window_pid(Display *display, Window window) {
     }
 }
 
-int main() {
+#if 0
+static void
+server_info_callback(pa_context *context, const pa_server_info *si, void *userdata) {
+    (void) context;
+    (void) userdata;
+    (void) si;
+    LOG("got server info.");
+}
+#endif
+
+static void
+debug_dump_proplist(pa_proplist *list) {
+    void *state = NULL;
+    const char *key = NULL;
+    while ((key = pa_proplist_iterate(list, &state))) {
+        printf("%s => %p\n", key, state);
+    }
+}
+
+static void
+client_info_callback(pa_context *context, const pa_client_info *ci, int eol, void *userdata) {
+    (void) context;
+    (void) eol;
+
+    if (!ci) {
+        // why are we called?
+        return;
+    }
+
+    SinkInput *input = userdata;
+    assert(input);
+    LOGF("Got client_info for sink_index = %u", input->sink_input_index);
+    const void *data = NULL;
+    size_t nbytes = 0;
+    int found_key = pa_proplist_get(
+            ci->proplist,
+            PA_PROP_APPLICATION_PROCESS_ID,
+            &data, &nbytes
+            ) == 0;
+
+    if (found_key) {
+        // TODO: verify is integer
+        int pid = atoi(data);
+
+        LOGF("Setting PID for sink_index = %u to %d", input->sink_input_index, pid);
+        input->pid = pid;
+    }
+}
+
+static void
+operation_callback(pa_operation *op, void *_user) {
+    switch (pa_operation_get_state(op)) {
+        case PA_OPERATION_DONE:
+        case PA_OPERATION_CANCELLED:
+            pa_operation_unref(op);
+            break;
+        default:
+            break;
+    }
+}
+
+static void
+init_sink_input(SinkInput *input, pa_context *context, const pa_sink_input_info *sii) {
+    input->sink_input_index = sii->index;
+
+    // update the volume?
+    memcpy(&input->true_volume, &sii->volume, sizeof(sii->volume));
+
+    // if PID not yet set (i.e. new sink input), request client info from
+    // which PID will be determined
+    if (input->pid == -1) {
+        if (sii->client != PA_INVALID_INDEX) {
+            LOGF("Requesting client info for sink input %d", sii->index);
+            pa_operation *op = pa_context_get_client_info(
+                    context, sii->client, client_info_callback, input);
+            pa_operation_set_state_callback(op, operation_callback, NULL);
+        }
+        else {
+            LOGF("WARNING: sink input %d has no client set; cannot determine PID!",
+                    sii->index);
+        }
+    } else {
+        LOGF("sink_input has PID = %d", input->pid);
+        assert(input->pid != 0);
+    }
+
+
+}
+
+static void
+sink_input_info_callback(
+        pa_context *context,
+        const pa_sink_input_info *sii,
+        int eol,
+        /* (State *) */ void *_state)
+{
+    (void) eol;
+    if (!sii) return;
+
+    State *state = _state;
+    SinkInput *input = get_sink_input(state, sii->index);
+    if (!input) {
+        input = add_sink_input(state);
+        init_sink_input(input, context, sii);
+    }
+    memcpy(&input->true_volume, &sii->volume, sizeof(sii->volume));
+}
+
+static void
+get_initial_sink_inputs(pa_context *context, State *state) {
+#if 0
+    printf("Requesting initial server info...\n");
+    pa_context_get_server_info(context, server_info_callback, userdata);
+#endif
+    printf("Requesting initial sink input info...\n");
+    pa_context_get_sink_input_info_list(context, sink_input_info_callback, state);
+}
+
+static void sub_callback(pa_context *context, pa_subscription_event_type_t t, uint32_t idx, void *userdata) {
+    int facility = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
+    int event = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
+
+    const char *facility_str = NULL;
+    switch (facility) {
+        case PA_SUBSCRIPTION_EVENT_SINK: facility_str = "sink"; break;
+        case PA_SUBSCRIPTION_EVENT_SOURCE: facility_str = "source"; break;
+        case PA_SUBSCRIPTION_EVENT_SINK_INPUT: facility_str = "sink_input"; break;
+        case PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT: facility_str = "source_output"; break;
+        case PA_SUBSCRIPTION_EVENT_MODULE: facility_str = "module"; break;
+        case PA_SUBSCRIPTION_EVENT_CLIENT: facility_str = "client"; break;
+        case PA_SUBSCRIPTION_EVENT_SAMPLE_CACHE: facility_str = "sample_cache"; break;
+        case PA_SUBSCRIPTION_EVENT_SERVER: facility_str = "server"; break;
+        case PA_SUBSCRIPTION_EVENT_CARD: facility_str = "card"; break;
+        default: facility_str = "UNKNOWN"; break;
+    }
+
+    const char *event_str = NULL;
+    switch (event) {
+        case PA_SUBSCRIPTION_EVENT_NEW: event_str = "new"; break;
+        case PA_SUBSCRIPTION_EVENT_CHANGE: event_str = "change"; break;
+        case PA_SUBSCRIPTION_EVENT_REMOVE: event_str = "remove"; break;
+        default: event_str = "UNKNOWN"; break;
+    }
+
+    if (facility == PA_SUBSCRIPTION_EVENT_SINK_INPUT) {
+        State *state = userdata;
+        if (event == PA_SUBSCRIPTION_EVENT_NEW || event == PA_SUBSCRIPTION_EVENT_CHANGE) {
+            pa_operation *op = pa_context_get_sink_input_info(
+                    context,
+                    idx,
+                    sink_input_info_callback,
+                    state
+                    );
+            pa_operation_set_state_callback(op, operation_callback, NULL);
+        } else if (event == PA_SUBSCRIPTION_EVENT_REMOVE) {
+            remove_sink_input(state, idx);
+        }
+    }
+#if 0
+    LOGF("facility = %s, event_type = %s", facility_str, event_str);
+#else
+    (void) facility_str;
+    (void) event_str;
+#endif
+}
+
+static void
+context_state_callback(pa_context *context, void *userdata) {
+    switch (pa_context_get_state(context)) {
+    case PA_CONTEXT_UNCONNECTED:
+        printf("PA_CONTEXT_UNCONNECTED");
+        break; /**< The context hasn't been connected yet */
+    case PA_CONTEXT_CONNECTING:
+        printf("PA_CONTEXT_CONNECTING");
+        break; /**< A connection is being established */
+    case PA_CONTEXT_AUTHORIZING:
+        printf("PA_CONTEXT_AUTHORIZING");
+        break; /**< The client is authorizing itself to the daemon */
+    case PA_CONTEXT_SETTING_NAME:
+        printf("PA_CONTEXT_SETTING_NAME");
+        break; /**< The client is passing its application name to the daemon */
+    case PA_CONTEXT_READY:
+        printf("PA_CONTEXT_READY");
+        pa_context_set_subscribe_callback(context, sub_callback, userdata);
+        pa_context_subscribe(context, PA_SUBSCRIPTION_MASK_SINK_INPUT, NULL, userdata);
+        get_initial_sink_inputs(context, (State *) userdata);
+        break; /**< The connection is established, the context is ready to execute operations */
+    case PA_CONTEXT_FAILED:
+        printf("PA_CONTEXT_FAILED");
+        break; /**< The connection failed or was disconnected */
+    case PA_CONTEXT_TERMINATED:
+        printf("PA_CONTEXT_TERMINATED");
+        break; /**< The connection was terminated cleanly */
+    }
+    puts("");
+}
+
+static void determine_balance(XConfigureEvent *conf, pa_cvolume *out) {
+    (void) conf;
+    (void) out;
+    NOT_IMPLEMENTED();
+}
+
+typedef struct ProcessNode {
+    pid_t pid;
+    struct ProcessNode *next;
+    struct ProcessNode *children;
+} ProcessNode;
+
+#define EXP_MAX_PROCESSES 12
+#define NUM_MAX_PROCESSES (1 << EXP_MAX_PROCESSES)
+
+typedef struct {
+    ProcessNode *root;
+    int32_t count;
+
+    Arena *arena;
+
+    // MSI hashtable mapping PID -> ProcessNode*
+    ProcessNode *ht[NUM_MAX_PROCESSES];
+} ProcessTree;
+
+bool
+is_numeric(const char *s) {
+    char ch;
+    while ((ch = *s++)) {
+        if (!isdigit(ch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int32_t
+ht_lookup(uint64_t hash, int exp, int32_t index) {
+    uint32_t mask = ((uint32_t)1 << exp) - 1;
+    uint32_t step = (hash >> (64 - exp)) | 1;
+    return (index + step) & mask;
+}
+
+static ProcessNode *
+process_tree_get(ProcessTree *tree, pid_t pid) {
+    // hash(pid) = pid
+    for (int32_t index = pid, count = 0; count < NUM_MAX_PROCESSES; count++) {
+        index = ht_lookup((uint64_t) pid, EXP_MAX_PROCESSES, index);
+        if (!tree->ht[index]) {
+            // empty slot found, create new node and return
+            ProcessNode *node = ARENA_ALLOC1(tree->arena, ProcessNode);
+            assert(node);
+            node->pid = pid;
+            tree->ht[index] = node;
+            return node;
+        }
+        else if (tree->ht[index]->pid == pid) {
+            // found
+            return tree->ht[index];
+        }
+    }
+    assert(0 && "map full");
+}
+
+static void
+process_tree_insert(ProcessTree *tree, pid_t pid, pid_t parent_pid) {
+    tree->count++;
+    ProcessNode *node = process_tree_get(tree, pid);
+    ProcessNode *parent = process_tree_get(tree, parent_pid);
+
+    node->next = parent->children;
+    parent->children = node;
+}
+
+void
+load_process_tree(ProcessTree *tree, Arena *arena) {
+    DIR *dir = opendir("/proc");
+    assert(dir);
+
+    tree->arena = arena;
+    tree->count = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if ((entry->d_type == DT_DIR)
+                && (strcmp(entry->d_name, ".") != 0)
+                && (strcmp(entry->d_name, "..") != 0)
+                && is_numeric(entry->d_name))
+        {
+            pid_t pid = atoi(entry->d_name);
+            char stat_file_path[PATH_MAX];
+            snprintf(stat_file_path, sizeof(stat_file_path),
+                    "/proc/%d/stat", pid);
+            FILE *f = fopen(stat_file_path, "rb");
+            if (f) {
+                pid_t parent_pid;
+                int matched = fscanf(f, "%*s %*s %*s %d", &parent_pid);
+                fclose(f);
+                if (matched) {
+                    process_tree_insert(tree, pid, parent_pid);
+                }
+            } else {
+                LOGF("warning: failed to read proc file %s", stat_file_path);
+            }
+        }
+    }
+
+    closedir(dir);
+}
+
+void
+debug_dump_process_node(ProcessNode *node, int depth) {
+    if (!node) {
+        return;
+    }
+
+    for (int i = 0; i < depth; i++) printf("  ");
+
+    printf("Process(%d)\n", node->pid);
+    for (ProcessNode *child = node->children; child; child = child->next) {
+        debug_dump_process_node(child, depth + 1);
+    }
+}
+
+void
+get_all_children(ProcessNode *node, pid_t *children, int32_t capacity, int32_t *count) {
+    assert((*count) < capacity);
+    children[(*count)++] = node->pid;
+
+    for (ProcessNode *child = node->children; child; child = child->next) {
+        get_all_children(child, children, capacity, count);
+    }
+}
+
+void
+get_process_children(pid_t pid, Arena *arena, pid_t **children, int32_t *child_count) {
+    ProcessTree tree = {0};
+    load_process_tree(&tree, arena);
+    ProcessNode *node = process_tree_get(&tree, pid);
+    *children = ARENA_ALLOC_ARRAY(arena, pid_t, tree.count);
+    get_all_children(node, *children, tree.count, child_count);
+}
+
+#ifndef MAX
+#define MAX(x, y) (((x) >= (y)) ? (x) : (y))
+#endif
+
+/**
+ * balance: left-right-balance, from 0.0f (only left) to 1.0f (only right)
+ */
+void adjust_volume_for_sink_input(pa_context *context, SinkInput *input, float balance) {
+    pa_cvolume volume;
+    memcpy(&volume, &input->true_volume, sizeof(volume));
+    if (volume.channels >= 2) {
+        pa_volume_t total = input->true_volume.values[0] + input->true_volume.values[1];
+        pa_volume_t left  = (1.0f - balance) * total;
+        pa_volume_t right = balance * total;
+        volume.values[0] = left;
+        volume.values[1] = right;
+
+        pa_operation *op = pa_context_set_sink_input_volume(
+                context,
+                input->sink_input_index,
+                &volume,
+                NULL,
+                NULL);
+        pa_operation_set_state_callback(op, operation_callback, NULL);
+    }
+}
+
+void adjust_volume(State *state, pa_context *context, pid_t pid, XConfigureEvent conf, Arena *arena) {
+    (void) conf;
+
+    float center = (float) conf.x + (float) conf.width / 2.0f;
+    float balance = (float) center / (2 * 1920);
+
+    SinkInput *input = get_sink_input_by_pid(state, pid);
+    if (input) {
+        adjust_volume_for_sink_input(context, input, balance);
+    }
+
+    // Also check children of `pid` for sink inputs
+    pid_t *children = NULL;
+    int32_t child_count = 0;
+    get_process_children(pid, arena, &children, &child_count);
+
+    for (int32_t i = 0; i < child_count; i++) {
+        SinkInput *input = get_sink_input_by_pid(state, children[i]);
+        if (input) {
+            adjust_volume_for_sink_input(context, input, balance);
+        }
+    }
+}
+
+int
+main() {
+    State *state = malloc(sizeof(*state));
+    state_init(state);
+
+    pa_mainloop *ml = pa_mainloop_new();
+    assert(ml);
+
+    pa_mainloop_api *ml_api = pa_mainloop_get_api(ml);
+    assert(ml_api);
+
+    pa_context *context = pa_context_new(ml_api, "helloworld");
+    assert(context);
+
+    pa_context_set_state_callback(context, context_state_callback, state);
+    assert(pa_context_connect(context, NULL, 0, NULL) >= 0);
+
+    // ------------------------------------------------------------
+
+    Arena temp;
+    size_t arena_size = 1024 * 1024;
+    void *memory = calloc(arena_size, 1);
+    arena_init(&temp, memory, arena_size);
+
     Display *dsp = XOpenDisplay(NULL);
     assert(dsp);
 
@@ -132,18 +644,21 @@ int main() {
     printf("status = %d\n", status);
 
     for (;;) {
-        for (int num_pending = XPending(dsp); num_pending >= 0; num_pending--) {
+        for (int num_pending = XPending(dsp); num_pending > 0; num_pending--) {
             XEvent event;
             XNextEvent(dsp, &event);
             if (event.type == ConfigureNotify) {
                 XConfigureEvent *conf = &event.xconfigure;
                 char *name = find_window_name(dsp, conf->window);
-                printf("Window (%s) is at (%d, %d)\n", name, conf->x, conf->y);
+                /* printf("Window (%s) is at (%d, %d)\n", name, conf->x, conf->y); */
                 if (name) XFree(name);
                 /* debug_dump_properties(dsp, conf->window); */
-                int pid = find_window_pid(dsp, conf->window);
-                printf("PID = %d\n", pid);
+                pid_t pid = find_window_pid(dsp, conf->window);
+                adjust_volume(state, context, pid, *conf, &temp);
             }
         }
+        arena_clear(&temp);
+
+        pa_mainloop_iterate(ml, 0, NULL);
     }
 }
