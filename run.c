@@ -2,22 +2,30 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <dirent.h>
 #include <string.h>
 #include <X11/Xlib.h>
 #include <pulse/pulseaudio.h>
+#include <x86intrin.h>
 
 #define ARENA_IMPLEMENTATION
 #include "arena.h"
 
-#define NOT_IMPLEMENTED() do { fprintf(stderr, "%s:%d (%s): not implemented\n", __FILE__, __LINE__, __func__); __builtin_trap(); } while (0);
+#define ABORT(msg) do { fprintf(stderr, "%s:%d (%s): " msg "\n", __FILE__, __LINE__, __func__); __builtin_trap(); } while (0);
+
+#define NOT_IMPLEMENTED() ABORT("not implemented")
 
 #define LOGF(msg, ...) fprintf(stderr, "%s:%d(%s): " msg "\n", __FILE__, __LINE__, __func__, __VA_ARGS__)
 #define LOG(msg) fprintf(stderr, "%s:%d(%s): %s\n", __FILE__, __LINE__, __func__, msg)
 
+#ifndef MAX
+#define MAX(x, y) (((x) >= (y)) ? (x) : (y))
+#endif
+
+int32_t get_children_recursive(Arena *arena, pid_t parent, pid_t **children);
+
 typedef struct SinkInput {
     unsigned int sink_input_index;
-    int pid;
+    pid_t pid;
     pa_cvolume true_volume;
 } SinkInput;
 
@@ -26,11 +34,15 @@ typedef struct SinkInput {
 typedef struct {
     bool pulse_initialized;
 
+    pa_context *context;
+    pa_mainloop *main_loop;
     SinkInput sink_inputs[NUM_MAX_SINK_INPUTS];
 } State;
 
 static void state_init(State *state) {
-    state->pulse_initialized = 0;
+    memset(state, 0, sizeof(*state));
+
+    state->pulse_initialized = false;
 
     for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
         state->sink_inputs[i].sink_input_index = PA_INVALID_INDEX;
@@ -87,7 +99,7 @@ remove_sink_input(State *state, unsigned int index) {
     }
 }
 
-static void
+void
 debug_print_sink_inputs(State *state) {
     LOG("------------------------------------------------------------");
     for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
@@ -144,7 +156,7 @@ get_window_pid(Display *display, Window window) {
     }
 }
 
-static void
+void
 debug_dump_properties(Display *d, Window w) {
     Window root, parent, *children = NULL;
     unsigned int nchildren = 0;
@@ -229,7 +241,7 @@ server_info_callback(pa_context *context, const pa_server_info *si, void *userda
 }
 #endif
 
-static void
+void
 debug_dump_proplist(pa_proplist *list) {
     void *state = NULL;
     const char *key = NULL;
@@ -270,6 +282,7 @@ client_info_callback(pa_context *context, const pa_client_info *ci, int eol, voi
 
 static void
 operation_callback(pa_operation *op, void *_user) {
+    (void) _user;
     switch (pa_operation_get_state(op)) {
         case PA_OPERATION_DONE:
         case PA_OPERATION_CANCELLED:
@@ -324,6 +337,9 @@ sink_input_info_callback(
         input = add_sink_input(state);
         init_sink_input(input, context, sii);
     }
+    LOGF("got sink_input_info_callback, setting true_volume = { .left = %d, .right = %d }",
+            sii->volume.values[0],
+            sii->volume.values[1]);
     memcpy(&input->true_volume, &sii->volume, sizeof(sii->volume));
 }
 
@@ -416,153 +432,6 @@ context_state_callback(pa_context *context, void *userdata) {
     puts("");
 }
 
-static void determine_balance(XConfigureEvent *conf, pa_cvolume *out) {
-    (void) conf;
-    (void) out;
-    NOT_IMPLEMENTED();
-}
-
-typedef struct ProcessNode {
-    pid_t pid;
-    struct ProcessNode *next;
-    struct ProcessNode *children;
-} ProcessNode;
-
-#define EXP_MAX_PROCESSES 12
-#define NUM_MAX_PROCESSES (1 << EXP_MAX_PROCESSES)
-
-typedef struct {
-    ProcessNode *root;
-    int32_t count;
-
-    Arena *arena;
-
-    // MSI hashtable mapping PID -> ProcessNode*
-    ProcessNode *ht[NUM_MAX_PROCESSES];
-} ProcessTree;
-
-bool
-is_numeric(const char *s) {
-    char ch;
-    while ((ch = *s++)) {
-        if (!isdigit(ch)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-int32_t
-ht_lookup(uint64_t hash, int exp, int32_t index) {
-    uint32_t mask = ((uint32_t)1 << exp) - 1;
-    uint32_t step = (hash >> (64 - exp)) | 1;
-    return (index + step) & mask;
-}
-
-static ProcessNode *
-process_tree_get(ProcessTree *tree, pid_t pid) {
-    // hash(pid) = pid
-    for (int32_t index = pid, count = 0; count < NUM_MAX_PROCESSES; count++) {
-        index = ht_lookup((uint64_t) pid, EXP_MAX_PROCESSES, index);
-        if (!tree->ht[index]) {
-            // empty slot found, create new node and return
-            ProcessNode *node = ARENA_ALLOC1(tree->arena, ProcessNode);
-            assert(node);
-            node->pid = pid;
-            tree->ht[index] = node;
-            return node;
-        }
-        else if (tree->ht[index]->pid == pid) {
-            // found
-            return tree->ht[index];
-        }
-    }
-    assert(0 && "map full");
-}
-
-static void
-process_tree_insert(ProcessTree *tree, pid_t pid, pid_t parent_pid) {
-    tree->count++;
-    ProcessNode *node = process_tree_get(tree, pid);
-    ProcessNode *parent = process_tree_get(tree, parent_pid);
-
-    node->next = parent->children;
-    parent->children = node;
-}
-
-void
-load_process_tree(ProcessTree *tree, Arena *arena) {
-    DIR *dir = opendir("/proc");
-    assert(dir);
-
-    tree->arena = arena;
-    tree->count = 0;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if ((entry->d_type == DT_DIR)
-                && (strcmp(entry->d_name, ".") != 0)
-                && (strcmp(entry->d_name, "..") != 0)
-                && is_numeric(entry->d_name))
-        {
-            pid_t pid = atoi(entry->d_name);
-            char stat_file_path[PATH_MAX];
-            snprintf(stat_file_path, sizeof(stat_file_path),
-                    "/proc/%d/stat", pid);
-            FILE *f = fopen(stat_file_path, "rb");
-            if (f) {
-                pid_t parent_pid;
-                int matched = fscanf(f, "%*s %*s %*s %d", &parent_pid);
-                fclose(f);
-                if (matched) {
-                    process_tree_insert(tree, pid, parent_pid);
-                }
-            } else {
-                LOGF("warning: failed to read proc file %s", stat_file_path);
-            }
-        }
-    }
-
-    closedir(dir);
-}
-
-void
-debug_dump_process_node(ProcessNode *node, int depth) {
-    if (!node) {
-        return;
-    }
-
-    for (int i = 0; i < depth; i++) printf("  ");
-
-    printf("Process(%d)\n", node->pid);
-    for (ProcessNode *child = node->children; child; child = child->next) {
-        debug_dump_process_node(child, depth + 1);
-    }
-}
-
-void
-get_all_children(ProcessNode *node, pid_t *children, int32_t capacity, int32_t *count) {
-    assert((*count) < capacity);
-    children[(*count)++] = node->pid;
-
-    for (ProcessNode *child = node->children; child; child = child->next) {
-        get_all_children(child, children, capacity, count);
-    }
-}
-
-void
-get_process_children(pid_t pid, Arena *arena, pid_t **children, int32_t *child_count) {
-    ProcessTree tree = {0};
-    load_process_tree(&tree, arena);
-    ProcessNode *node = process_tree_get(&tree, pid);
-    *children = ARENA_ALLOC_ARRAY(arena, pid_t, tree.count);
-    get_all_children(node, *children, tree.count, child_count);
-}
-
-#ifndef MAX
-#define MAX(x, y) (((x) >= (y)) ? (x) : (y))
-#endif
-
 /**
  * balance: left-right-balance, from 0.0f (only left) to 1.0f (only right)
  */
@@ -570,9 +439,15 @@ void adjust_volume_for_sink_input(pa_context *context, SinkInput *input, float b
     pa_cvolume volume;
     memcpy(&volume, &input->true_volume, sizeof(volume));
     if (volume.channels >= 2) {
+#if 0
         pa_volume_t total = input->true_volume.values[0] + input->true_volume.values[1];
         pa_volume_t left  = (1.0f - balance) * total;
         pa_volume_t right = balance * total;
+#else
+        pa_volume_t max = MAX(input->true_volume.values[0], input->true_volume.values[1]);
+        pa_volume_t left = (balance > 0.5f) ? ((1.0f - balance) * max) : max;
+        pa_volume_t right = (balance > 0.5f) ? max : (balance * max);
+#endif
         volume.values[0] = left;
         volume.values[1] = right;
 
@@ -586,21 +461,34 @@ void adjust_volume_for_sink_input(pa_context *context, SinkInput *input, float b
     }
 }
 
+static inline float
+clampf(float x, float lo, float hi) {
+    if (x < lo) return 0.0f;
+    if (x > hi) return 1.0f;
+    return x;
+}
+
 void adjust_volume(State *state, pa_context *context, pid_t pid, XConfigureEvent conf, Arena *arena) {
     (void) conf;
 
     float center = (float) conf.x + (float) conf.width / 2.0f;
-    float balance = (float) center / (2 * 1920);
+    float balance = clampf((float) center / (2 * 1920), 0.0f, 1.0f);
+
 
     SinkInput *input = get_sink_input_by_pid(state, pid);
     if (input) {
         adjust_volume_for_sink_input(context, input, balance);
     }
 
+    //alternative: walk up process hierarchy for each sink input's process
+    //until `pid` is found
+
     // Also check children of `pid` for sink inputs
     pid_t *children = NULL;
-    int32_t child_count = 0;
-    get_process_children(pid, arena, &children, &child_count);
+    /* uint64_t _start = _rdtsc(); */
+    int32_t child_count = get_children_recursive(arena, pid, &children);
+    /* uint64_t _elapsed = _rdtsc() - _start; */
+    /* LOGF("get_process_children() took %lf Mcycles", (float) _elapsed / 1e6); */
 
     for (int32_t i = 0; i < child_count; i++) {
         SinkInput *input = get_sink_input_by_pid(state, children[i]);
@@ -610,10 +498,61 @@ void adjust_volume(State *state, pa_context *context, pid_t pid, XConfigureEvent
     }
 }
 
+// grr, state needs to be global for signal handler...
+// NOTE: the state will _only_ ever be referred to by `global_state`
+// during `exit_handler`.
+// Otherwise, it will _always_ be passed around explicitly.
+State *global_state = NULL;
+
+static void
+exit_handler(int signo) {
+    // TODO: not working correctly yet
+    (void) signo;
+    printf("terminating.\n");
+
+    if (global_state && global_state->pulse_initialized) {
+        LOG("hi");
+        for (int i = 0; i < NUM_MAX_SINK_INPUTS; i++) {
+            SinkInput *input = &global_state->sink_inputs[i];
+            if (input->sink_input_index != PA_INVALID_INDEX) {
+                LOGF("resetting volume for sink input %u", input->sink_input_index);
+                // reset volume
+                pa_cvolume volume;
+                memcpy(&volume, &input->true_volume, sizeof(input->true_volume));
+                pa_volume_t total = input->true_volume.values[0] + input->true_volume.values[1];
+                pa_volume_t left  = total / 2.0f;
+                pa_volume_t right = total / 2.0f;
+                volume.values[0] = left;
+                volume.values[1] = right;
+
+                pa_operation *op = pa_context_set_sink_input_volume(
+                        global_state->context,
+                        input->sink_input_index,
+                        &volume,
+                        NULL,
+                        NULL);
+                while (pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+                    pa_mainloop_iterate(global_state->main_loop, 0, NULL);
+                }
+                pa_operation_unref(op);
+            }
+        }
+
+        pa_context_disconnect(global_state->context);
+    }
+
+    exit(0);
+}
+
+
 int
 main() {
-    State *state = malloc(sizeof(*state));
+    global_state = malloc(sizeof(*global_state));
+    State *state = global_state;
     state_init(state);
+
+    signal(SIGINT, exit_handler);
+    signal(SIGTERM, exit_handler);
 
     pa_mainloop *ml = pa_mainloop_new();
     assert(ml);
@@ -627,6 +566,10 @@ main() {
     pa_context_set_state_callback(context, context_state_callback, state);
     assert(pa_context_connect(context, NULL, 0, NULL) >= 0);
 
+    state->context = context;
+    state->main_loop = ml;
+    state->pulse_initialized = true;
+
     // ------------------------------------------------------------
 
     Arena temp;
@@ -636,6 +579,7 @@ main() {
 
     Display *dsp = XOpenDisplay(NULL);
     assert(dsp);
+    // TODO: close display on exit?
 
     Window root = DefaultRootWindow(dsp);
     assert(root);
@@ -649,10 +593,6 @@ main() {
             XNextEvent(dsp, &event);
             if (event.type == ConfigureNotify) {
                 XConfigureEvent *conf = &event.xconfigure;
-                char *name = find_window_name(dsp, conf->window);
-                /* printf("Window (%s) is at (%d, %d)\n", name, conf->x, conf->y); */
-                if (name) XFree(name);
-                /* debug_dump_properties(dsp, conf->window); */
                 pid_t pid = find_window_pid(dsp, conf->window);
                 adjust_volume(state, context, pid, *conf, &temp);
             }
